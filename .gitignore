@@ -1,3 +1,6 @@
+base_cv.txt
+.DS_Store
+indeed_profile/
 venv/
 __pycache__/
 *.csv

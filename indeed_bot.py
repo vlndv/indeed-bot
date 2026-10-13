@@ -1,107 +1,100 @@
+import re
 import time
 import random
 import csv
 import ollama
 from playwright.sync_api import sync_playwright
 
+print("DEBUG 1: Imports successful")
+
 # --- CONFIGURATION ---
-SEARCH_QUERY = "Data Analyst"
+SEARCH_QUERY = "Junior Python ML"
 LOCATION = "Remote"
-BASE_CV = "5 years Python, SQL, Tableau. Experience in data cleaning and dashboard creation."
-MAX_JOBS = 3 
+MAX_JOBS = 1
+MAX_DESC_CHARS = 6000
 
-# --- 1. LLM FUNCTION ---
-def extract_and_tailor(raw_card_text):
-    prompt = f"""
-    You are an expert resume writer and data extractor. 
-    Here is the raw text from a job posting: 
-    {raw_card_text}
-    
-    Base CV: {BASE_CV}
-    
-    Task:
-    1. Extract the Job Title and Company Name from the raw text.
-    2. Rewrite the Base CV to perfectly match the job description. Highlight relevant skills and add keywords.
-    
-    Output STRICTLY in this exact format (no extra text):
-    Title: [Job Title]
-    Company: [Company Name]
-    Tailored_CV: [Your rewritten CV text here]
-    """
-    response = ollama.chat(model='qwen2.5:14b', messages=[{'role': 'user', 'content': prompt}])
-    return response['message']['content']
+try:
+    with open('base_cv.txt', 'r', encoding='utf-8') as file:
+        BASE_CV = file.read().strip()
+    print("DEBUG 2: base_cv.txt loaded successfully")
+except FileNotFoundError:
+    BASE_CV = "Fallback CV text."
+    print("DEBUG 2: base_cv.txt NOT found, using fallback")
 
-# --- 2. BROWSER AUTOMATION ---
+def extract_and_tailor(job_text):
+    print("DEBUG 4: Sending text to Ollama...")
+    prompt = f"Extract Title, Company, and tailor this CV: {BASE_CV} to this job: {job_text[:MAX_DESC_CHARS]}. Output strictly as: Title: [x]\nCompany: [y]\nTailored_CV: [z]"
+    response = ollama.chat(model="qwen2.5:7b", messages=[{"role": "user", "content": prompt}])
+    print("DEBUG 5: Ollama responded!")
+    return response["message"]["content"]
+
+def parse_output(text):
+    title = re.search(r"Title:\s*(.+)", text, re.IGNORECASE)
+    company = re.search(r"Company:\s*(.+)", text, re.IGNORECASE)
+    cv = re.search(r"Tailored_CV:\s*(.*)", text, re.IGNORECASE | re.DOTALL)
+    return (
+        title.group(1).strip() if title else "Unknown",
+        company.group(1).strip() if company else "Unknown",
+        re.sub(r"\s+", " ", cv.group(1)).strip() if cv else "",
+    )
+
 def scrape_and_process():
     results = []
-    
+    print("DEBUG 3: Launching Playwright browser...")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False) 
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        browser = p.chromium.launch(headless=False)
+        print("DEBUG 3b: Browser launched. Opening new page...")
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
         
-        url = f"https://www.indeed.com/jobs?q={SEARCH_QUERY}&l={LOCATION}"
-        page.goto(url)
-        time.sleep(random.uniform(4, 6))
+        print(f"DEBUG 3c: Going to Indeed for {SEARCH_QUERY}...")
+        page.goto(f"https://www.indeed.com/jobs?q={SEARCH_QUERY}&l={LOCATION}")
+        time.sleep(5)
+        print("DEBUG 3d: Page loaded. Looking for jobs...")
+
+        job_cards = page.query_selector_all(".job_seen_beacon") or page.query_selector_all("ul.jobsearch-ResultsList > li")
         
-        # Try to find job cards (Indeed changes these often, so we have a fallback)
-        job_cards = page.query_selector_all('.job_seen_beacon')
         if not job_cards:
-            job_cards = page.query_selector_all('ul.jobsearch-ResultsList > li')
-            
+            print("DEBUG ERROR: No job cards found!")
+        else:
+            print(f"DEBUG: Found {len(job_cards)} job cards. Processing first {MAX_JOBS}...")
+
         for i, card in enumerate(job_cards[:MAX_JOBS]):
             try:
-                # Extract ALL text from the card (immune to HTML changes)
-                raw_text = card.inner_text()
+                print(f"\n--- Processing Job {i+1} ---")
+                link = card.query_selector("h2 a") or card.query_selector("a")
+                job_url = link.get_attribute("href") if link else page.url
                 
-                # Extract URL from the first link in the card
-                link_el = card.query_selector('a')
-                job_url = link_el.get_attribute('href') if link_el else page.url
-                if job_url.startswith('/'):
-                    job_url = f"https://www.indeed.com{job_url}"
+                print("DEBUG: Clicking job to get full description...")
+                try:
+                    link.click()
+                    page.wait_for_selector("#jobDescriptionText", timeout=5000)
+                    description = page.inner_text("#jobDescriptionText")
+                except:
+                    description = card.inner_text()
                 
-                print(f"Processing job {i+1}...")
+                print("DEBUG: Got description. Calling AI...")
+                ai_response = extract_and_tailor(description)
+                title, company, tailored_cv = parse_output(ai_response)
                 
-                # Send raw text to Qwen to extract info and tailor CV
-                qwen_output = extract_and_tailor(raw_text)
-                
-                # Parse Qwen's output
-                title, company, tailored_cv = "Unknown", "Unknown", ""
-                for line in qwen_output.split('\n'):
-                    if line.startswith("Title:"): title = line.replace("Title:", "").strip()
-                    elif line.startswith("Company:"): company = line.replace("Company:", "").strip()
-                    elif line.startswith("Tailored_CV:"): tailored_cv = line.replace("Tailored_CV:", "").strip()
-                
-                results.append({
-                    'Title': title,
-                    'Company': company,
-                    'URL': job_url,
-                    'Tailored_CV': tailored_cv.replace('\n', ' ')
-                })
-                
-                # Random delay to mimic human behavior
-                time.sleep(random.uniform(4, 8))
-                
+                results.append({"Title": title, "Company": company, "URL": job_url, "Tailored_CV": tailored_cv})
+                print(f"DEBUG: Job {i+1} complete!")
+                time.sleep(3)
             except Exception as e:
-                print(f"Error on job {i+1}: {e}")
+                print(f"DEBUG ERROR on job {i+1}: {e}")
                 continue
-                
+
         browser.close()
     return results
 
-# --- 3. SAVE REPORT ---
 def save_report(data):
-    with open('indeed_job_report.csv', 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['Title', 'Company', 'URL', 'Tailored_CV'])
+    with open("indeed_job_report.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["Title", "Company", "URL", "Tailored_CV"])
         writer.writeheader()
         writer.writerows(data)
     print("✅ Report saved to indeed_job_report.csv")
 
 if __name__ == "__main__":
-    print("🚀 Starting Indeed automation on macOS...")
-    jobs_data = scrape_and_process()
-    save_report(jobs_data)
+    print("🚀 Starting Indeed automation...")
+    save_report(scrape_and_process())
 
